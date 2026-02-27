@@ -1,5 +1,6 @@
 import { DebtDTO, DebtStatus } from '../models/Debit.model';
 import { DepositDTO } from '../models/Deposit.model';
+import { ExpenseDTO } from '../models/Expense.model';
 
 const VALID_DEBT_STATUS: DebtStatus[] = ['pending', 'partially_paid', 'paid'];
 
@@ -81,5 +82,24 @@ export function validatePayDebtInput(
 
   if (installmentsToPay !== undefined) {
     validateInstallments(installmentsToPay, 'installmentsToPay');
+  }
+}
+
+export function validateExpenseInput(input: ExpenseDTO): void {
+  validateRequiredString(input.description, 'description');
+  validatePositiveNumber(input.value, 'value');
+
+  if (input.tags !== undefined) {
+    if (!Array.isArray(input.tags)) {
+      throw new Error('O campo tags deve ser um array quando informado');
+    }
+
+    const hasInvalidTag = input.tags.some(
+      (tag) => typeof tag !== 'string' || tag.trim().length === 0
+    );
+
+    if (hasInvalidTag) {
+      throw new Error('Todas as tags devem ser textos não vazios');
+    }
   }
 }

@@ -1,13 +1,16 @@
 import { Debt, DebtDTO } from '../models/Debit.model';
 import { Deposit, DepositDTO } from '../models/Deposit.model';
+import { Expense, ExpenseDTO } from '../models/Expense.model';
 import { DebtRepository } from '../repository/entities/debt.entity';
 import DepositRepository from '../repository/entities/deposit.entity';
+import ExpenseRepository from '../repository/entities/expense.entity';
 import { PersonRepository } from '../repository/entities/person.entity';
 import { randomUUID } from 'crypto';
 import Neo4jService from './drivers/neo4jDriver';
 import {
   validateDebtInput,
   validateDepositInput,
+  validateExpenseInput,
   validatePayDebtInput,
   validateRequiredField
 } from '../validation/input.validation';
@@ -252,6 +255,65 @@ export default class SystemService {
     const depositRepo = new DepositRepository();
     const deposits = await depositRepo.lisDepositByUserId(userId);
     return deposits.sort(
+      (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
+    );
+  }
+
+  public async register_expense(
+    userId: string,
+    expense: ExpenseDTO
+  ): Promise<void> {
+    validateRequiredField(userId, 'userId');
+    validateExpenseInput(expense);
+
+    const expenseRepo = new ExpenseRepository();
+    const value = Number(expense.value.toFixed(2));
+
+    await Neo4jService.executeWrite(async (tx) => {
+      const debitResult = await Neo4jService.runInTransaction(
+        tx,
+        `
+          MATCH (p:Person { id: $personId })
+          WHERE coalesce(p.money, 0) >= $amount
+          SET p.money = coalesce(p.money, 0) - $amount
+          RETURN p
+        `,
+        {
+          personId: userId,
+          amount: value
+        }
+      );
+
+      if (debitResult.records.length === 0) {
+        throw new Error('Saldo insuficiente ou usuário não encontrado');
+      }
+
+      await expenseRepo.addExpense(
+        userId,
+        {
+          id: randomUUID(),
+          description: expense.description,
+          value,
+          tags: expense.tags || [],
+          date: expense.date || new Date().toISOString()
+        },
+        tx
+      );
+    });
+  }
+
+  public async registerExpense(
+    userId: string,
+    expense: ExpenseDTO
+  ): Promise<void> {
+    return this.register_expense(userId, expense);
+  }
+
+  public async listExpenses(userId: string): Promise<Expense[]> {
+    validateRequiredField(userId, 'userId');
+    const expenseRepo = new ExpenseRepository();
+    const expenses = await expenseRepo.listExpensesByUserId(userId);
+    return expenses.sort(
       (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
     );
   }

@@ -12,6 +12,7 @@ import SystemService from './service/system.service';
 import { Person } from './models/Person.model';
 import { Debt } from './models/Debit.model';
 import { Deposit } from './models/Deposit.model';
+import { Expense } from './models/Expense.model';
 import { PersonRepository } from './repository/entities/person.entity';
 
 const system = new SystemService();
@@ -161,8 +162,10 @@ async function commandHelp(): Promise<void> {
   console.log('  financas listUsers');
   console.log('  financas summary');
   console.log('  financas addDeposit <valor> <descricao> [--loan] [--creditor <nome>]');
+  console.log('  financas addExpense <valor> <descricao> [--tags <a,b>]');
   console.log('  financas addDebt <titulo> <credor> [--amount <valor>] [--installments <n>] [--due <YYYY-MM-DD>] [--tags <a,b>]');
   console.log('  financas listDeposits');
+  console.log('  financas listExpenses');
   console.log('  financas listDebts');
   console.log('  financas payDebt <debtId> <parcelas> [valor]');
   console.log('  financas deleteUser <nome-ou-id>');
@@ -236,20 +239,23 @@ async function commandListUsers(): Promise<void> {
 async function commandSummary(): Promise<void> {
   const user = await requireActiveUser();
 
-  const [debts, deposits] = await Promise.all([
+  const [debts, deposits, expenses] = await Promise.all([
     system.listDebts(user.id),
-    system.listDeposits(user.id)
+    system.listDeposits(user.id),
+    system.listExpenses(user.id)
   ]);
 
   const pendingDebts = debts.filter((debt) => debt.status !== 'paid');
   const totalDebt = debts.reduce((sum, debt) => sum + toNumber(debt.remainingAmount), 0);
   const totalDeposits = deposits.reduce((sum, dep) => sum + toNumber(dep.value), 0);
+  const totalExpenses = expenses.reduce((sum, exp) => sum + toNumber(exp.value), 0);
 
   console.log(chalk.bold('\n📊 Resumo do usuário ativo'));
   console.log(chalk.white(`Nome: ${user.name}`));
   console.log(chalk.white(`ID: ${user.id}`));
   console.log(chalk.white(`Saldo atual: ${formatMoney(user.money)}`));
   console.log(chalk.white(`Depósitos registrados: ${deposits.length} (${formatMoney(totalDeposits)})`));
+  console.log(chalk.white(`Despesas registradas: ${expenses.length} (${formatMoney(totalExpenses)})`));
   console.log(chalk.white(`Dívidas pendentes: ${pendingDebts.length} (${formatMoney(totalDebt)})`));
 }
 
@@ -341,6 +347,41 @@ async function commandAddDebt(args: string[], options: Record<string, string | b
   printSuccess(`Dívida registrada para ${user.name}: ${title}`);
 }
 
+async function commandAddExpense(
+  args: string[],
+  options: Record<string, string | boolean>
+): Promise<void> {
+  const user = await requireActiveUser();
+
+  const valueText = args[0];
+  const description = args[1];
+
+  if (!valueText || !description) {
+    throw new Error('Uso: financas addExpense <valor> <descricao> [--tags <a,b>]');
+  }
+
+  const value = Number(valueText.replace(',', '.'));
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error('Valor da despesa inválido. Informe um número maior que 0.');
+  }
+
+  const tags =
+    typeof options.tags === 'string'
+      ? options.tags
+          .split(',')
+          .map((tag) => tag.trim())
+          .filter((tag) => tag.length > 0)
+      : [];
+
+  await system.register_expense(user.id, {
+    value,
+    description,
+    tags
+  });
+
+  printSuccess(`Despesa registrada para ${user.name}: ${formatMoney(value)}`);
+}
+
 async function commandListDebts(): Promise<void> {
   const user = await requireActiveUser();
   const debts = await system.listDebts(user.id);
@@ -412,6 +453,40 @@ async function commandListDeposits(): Promise<void> {
       deposit.isLoan ? 'Sim' : 'Não',
       deposit.creditorName || '-',
       formatDate(deposit.date)
+    ]);
+  });
+
+  console.log(table.toString());
+}
+
+async function commandListExpenses(): Promise<void> {
+  const user = await requireActiveUser();
+  const expenses = await system.listExpenses(user.id);
+
+  if (expenses.length === 0) {
+    printInfo('Nenhuma despesa encontrada para o usuário ativo.');
+    return;
+  }
+
+  const table = new Table({
+    head: [
+      chalk.white('ID'),
+      chalk.white('Descrição'),
+      chalk.white('Valor'),
+      chalk.white('Tags'),
+      chalk.white('Data')
+    ],
+    colWidths: [38, 24, 14, 22, 14],
+    wordWrap: true
+  });
+
+  expenses.forEach((expense: Expense) => {
+    table.push([
+      expense.id,
+      expense.description,
+      formatMoney(expense.value),
+      expense.tags.length > 0 ? expense.tags.join(', ') : '-',
+      formatDate(expense.date)
     ]);
   });
 
@@ -493,6 +568,9 @@ async function run(): Promise<void> {
       case 'addDeposit':
         await commandAddDeposit(positional, options);
         break;
+      case 'addExpense':
+        await commandAddExpense(positional, options);
+        break;
       case 'addDebt':
         await commandAddDebt(positional, options);
         break;
@@ -501,6 +579,9 @@ async function run(): Promise<void> {
         break;
       case 'listDeposits':
         await commandListDeposits();
+        break;
+      case 'listExpenses':
+        await commandListExpenses();
         break;
       case 'payDebt':
         await commandPayDebt(positional[0], positional[1], positional[2]);
