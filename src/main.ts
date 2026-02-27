@@ -1,20 +1,26 @@
+#!/usr/bin/env node
 import 'dotenv/config';
-import inquirer from 'inquirer';
 import chalk from 'chalk';
 import Table from 'cli-table3';
 import { randomUUID } from 'crypto';
+import { promises as fs } from 'fs';
+import path from 'path';
+import os from 'os';
 
 import Neo4jService from './service/drivers/neo4jDriver';
 import SystemService from './service/system.service';
 import { Person } from './models/Person.model';
-import { Debt, DebtStatus } from './models/Debit.model';
+import { Debt } from './models/Debit.model';
 import { Deposit } from './models/Deposit.model';
 import { PersonRepository } from './repository/entities/person.entity';
 
 const system = new SystemService();
 const personRepo = new PersonRepository();
+const stateFilePath = path.join(os.homedir(), '.financas-cli.json');
 
-let activeUserId: string | null = null;
+type CliState = {
+  activeUserId?: string;
+};
 
 function toNumber(value: unknown): number {
   if (typeof value === 'number') return value;
@@ -37,25 +43,10 @@ function formatMoney(value: unknown): string {
   }).format(toNumber(value));
 }
 
-function formatOptionalMoney(value: unknown): string {
-  if (value === undefined || value === null) {
-    return 'Indefinido';
-  }
-  return formatMoney(value);
-}
-
 function formatDate(value: string | undefined): string {
   if (!value) return '-';
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('pt-BR');
-}
-
-function printHeader(): void {
-  console.clear();
-  console.log(chalk.blueBright('╔══════════════════════════════════════════════╗'));
-  console.log(chalk.blueBright('║') + chalk.bold.white('         FINANÇAS PESSOAIS • NEO4J CLI         ') + chalk.blueBright('║'));
-  console.log(chalk.blueBright('╚══════════════════════════════════════════════╝'));
-  console.log(chalk.gray('Controle de usuários, depósitos, dívidas e pagamentos\n'));
 }
 
 function printSuccess(message: string): void {
@@ -71,34 +62,168 @@ function printInfo(message: string): void {
   console.log(chalk.cyan(`ℹ️  ${message}`));
 }
 
-function requireActiveUser(): string {
-  if (!activeUserId) {
-    throw new Error('Nenhum usuário ativo selecionado.');
+function parseOptions(args: string[]): {
+  positional: string[];
+  options: Record<string, string | boolean>;
+} {
+  const positional: string[] = [];
+  const options: Record<string, string | boolean> = {};
+
+  for (let index = 0; index < args.length; index++) {
+    const token = args[index];
+
+    if (!token.startsWith('--')) {
+      positional.push(token);
+      continue;
+    }
+
+    const key = token.slice(2);
+    const next = args[index + 1];
+
+    if (!next || next.startsWith('--')) {
+      options[key] = true;
+      continue;
+    }
+
+    options[key] = next;
+    index += 1;
   }
-  return activeUserId;
+
+  return { positional, options };
 }
 
-async function listUsers(showTitle: boolean = true): Promise<Person[]> {
-  const users = await personRepo.list();
-
-  if (showTitle) {
-    console.log(chalk.bold('\n👥 Usuários cadastrados'));
+async function readState(): Promise<CliState> {
+  try {
+    const raw = await fs.readFile(stateFilePath, 'utf-8');
+    const data = JSON.parse(raw) as CliState;
+    return data || {};
+  } catch {
+    return {};
   }
+}
+
+async function writeState(state: CliState): Promise<void> {
+  await fs.writeFile(stateFilePath, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+async function getUsers(): Promise<Person[]> {
+  return personRepo.list();
+}
+
+async function resolveUserByNameOrId(identifier: string): Promise<Person> {
+  const users = await getUsers();
+  if (users.length === 0) {
+    throw new Error('Nenhum usuário cadastrado. Use: financas createUser <nome> [saldo]');
+  }
+
+  const normalized = identifier.trim().toLowerCase();
+  const byId = users.find((user) => user.id === identifier);
+  if (byId) return byId;
+
+  const byName = users.filter((user) => user.name.trim().toLowerCase() === normalized);
+
+  if (byName.length === 0) {
+    throw new Error(`Usuário não encontrado: ${identifier}`);
+  }
+
+  if (byName.length > 1) {
+    throw new Error(
+      `Há ${byName.length} usuários com esse nome. Use o id no comando setUser.`
+    );
+  }
+
+  return byName[0];
+}
+
+async function requireActiveUser(): Promise<Person> {
+  const state = await readState();
+
+  if (!state.activeUserId) {
+    throw new Error('Nenhum usuário ativo. Defina com: financas setUser <nome-ou-id>');
+  }
+
+  const user = await personRepo.findById(state.activeUserId);
+  if (!user) {
+    await writeState({});
+    throw new Error('Usuário ativo não existe mais. Defina novamente com setUser.');
+  }
+
+  return user;
+}
+
+async function commandHelp(): Promise<void> {
+  console.log(chalk.bold('\nFINANÇAS CLI'));
+  console.log('Uso: financas <comando> [argumentos] [--opcoes]\n');
+  console.log('Comandos principais:');
+  console.log('  financas createUser <nome> [saldo]');
+  console.log('  financas setUser <nome-ou-id>');
+  console.log('  financas whoami');
+  console.log('  financas listUsers');
+  console.log('  financas summary');
+  console.log('  financas addDeposit <valor> <descricao> [--loan] [--creditor <nome>]');
+  console.log('  financas addDebt <titulo> <credor> [--amount <valor>] [--installments <n>] [--due <YYYY-MM-DD>] [--tags <a,b>]');
+  console.log('  financas listDeposits');
+  console.log('  financas listDebts');
+  console.log('  financas payDebt <debtId> <parcelas> [valor]');
+  console.log('  financas deleteUser <nome-ou-id>');
+  console.log('\nExemplo:');
+  console.log('  financas setUser vinicius');
+  console.log('  financas addDeposit 1500 salario');
+}
+
+async function commandCreateUser(name?: string, initialMoney?: string): Promise<void> {
+  if (!name || !name.trim()) {
+    throw new Error('Uso: financas createUser <nome> [saldo]');
+  }
+
+  const parsedMoney = initialMoney === undefined ? 0 : Number(initialMoney.replace(',', '.'));
+  if (!Number.isFinite(parsedMoney) || parsedMoney < 0) {
+    throw new Error('Saldo inicial inválido. Informe um número >= 0.');
+  }
+
+  const id = randomUUID();
+  await personRepo.create({
+    id,
+    name: name.trim(),
+    money: parsedMoney
+  });
+
+  await writeState({ activeUserId: id });
+  printSuccess(`Usuário criado e definido como ativo: ${name.trim()}`);
+}
+
+async function commandSetUser(identifier?: string): Promise<void> {
+  if (!identifier || !identifier.trim()) {
+    throw new Error('Uso: financas setUser <nome-ou-id>');
+  }
+
+  const user = await resolveUserByNameOrId(identifier);
+  await writeState({ activeUserId: user.id });
+  printSuccess(`Usuário ativo: ${user.name} (${formatMoney(user.money)})`);
+}
+
+async function commandWhoAmI(): Promise<void> {
+  const user = await requireActiveUser();
+  printInfo(`Usuário ativo: ${user.name} • ${formatMoney(user.money)} • ${user.id}`);
+}
+
+async function commandListUsers(): Promise<void> {
+  const users = await getUsers();
+  const state = await readState();
 
   if (users.length === 0) {
     printInfo('Nenhum usuário cadastrado.');
-    return users;
+    return;
   }
 
   const table = new Table({
     head: [chalk.white('Ativo'), chalk.white('Nome'), chalk.white('Saldo'), chalk.white('ID')],
-    wordWrap: true,
-    colWidths: [8, 22, 16, 40]
+    colWidths: [8, 24, 16, 40]
   });
 
   users.forEach((user) => {
     table.push([
-      user.id === activeUserId ? chalk.green('●') : chalk.gray('○'),
+      user.id === state.activeUserId ? chalk.green('●') : chalk.gray('○'),
       user.name,
       formatMoney(user.money),
       user.id
@@ -106,83 +231,18 @@ async function listUsers(showTitle: boolean = true): Promise<Person[]> {
   });
 
   console.log(table.toString());
-  return users;
 }
 
-async function createUser(): Promise<void> {
-  const answers = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'name',
-      message: 'Nome do usuário:',
-      validate: (value: string) =>
-        value.trim().length > 0 ? true : 'Informe um nome válido.'
-    },
-    {
-      type: 'number',
-      name: 'money',
-      message: 'Saldo inicial (R$):',
-      default: 0,
-      validate: (value: number) =>
-        Number.isFinite(value) && value >= 0
-          ? true
-          : 'Informe um saldo inicial maior ou igual a 0.'
-    }
+async function commandSummary(): Promise<void> {
+  const user = await requireActiveUser();
+
+  const [debts, deposits] = await Promise.all([
+    system.listDebts(user.id),
+    system.listDeposits(user.id)
   ]);
-
-  const id = randomUUID();
-  await personRepo.create({
-    id,
-    name: answers.name.trim(),
-    money: answers.money
-  });
-
-  activeUserId = id;
-  printSuccess(`Usuário criado e definido como ativo: ${answers.name.trim()}`);
-}
-
-async function selectActiveUser(): Promise<void> {
-  const users = await personRepo.list();
-  if (users.length === 0) {
-    printInfo('Nenhum usuário disponível para seleção.');
-    return;
-  }
-
-  const { userId } = await inquirer.prompt([
-    {
-      type: 'list',
-      name: 'userId',
-      message: 'Selecione o usuário ativo:',
-      choices: users.map((user) => ({
-        name: `${user.name} • ${formatMoney(user.money)} • ${user.id}`,
-        value: user.id
-      }))
-    }
-  ]);
-
-  activeUserId = userId;
-  const selected = users.find((user) => user.id === userId);
-  printSuccess(`Usuário ativo: ${selected?.name}`);
-}
-
-async function showActiveUserSummary(): Promise<void> {
-  const userId = requireActiveUser();
-  const [user, debts, deposits] = await Promise.all([
-    personRepo.findById(userId),
-    system.listDebts(userId),
-    system.listDeposits(userId)
-  ]);
-
-  if (!user) {
-    activeUserId = null;
-    throw new Error('Usuário ativo não foi encontrado. Selecione novamente.');
-  }
 
   const pendingDebts = debts.filter((debt) => debt.status !== 'paid');
-  const totalDebt = debts.reduce(
-    (sum, debt) => sum + toNumber(debt.remainingAmount),
-    0
-  );
+  const totalDebt = debts.reduce((sum, debt) => sum + toNumber(debt.remainingAmount), 0);
   const totalDeposits = deposits.reduce((sum, dep) => sum + toNumber(dep.value), 0);
 
   console.log(chalk.bold('\n📊 Resumo do usuário ativo'));
@@ -193,175 +253,160 @@ async function showActiveUserSummary(): Promise<void> {
   console.log(chalk.white(`Dívidas pendentes: ${pendingDebts.length} (${formatMoney(totalDebt)})`));
 }
 
-async function registerDeposit(): Promise<void> {
-  const userId = requireActiveUser();
-  const answers = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'name',
-      message: 'Descrição do depósito:',
-      validate: (value: string) =>
-        value.trim().length > 0 ? true : 'Informe uma descrição válida.'
-    },
-    {
-      type: 'number',
-      name: 'value',
-      message: 'Valor (R$):',
-      validate: (value: number) =>
-        Number.isFinite(value) && value > 0 ? true : 'Informe um valor maior que 0.'
-    },
-    {
-      type: 'confirm',
-      name: 'isLoan',
-      message: 'Esse depósito é um empréstimo?',
-      default: false
-    },
-    {
-      type: 'input',
-      name: 'creditorName',
-      message: 'Nome do credor:',
-      when: (answersMap: { isLoan: boolean }) => answersMap.isLoan,
-      validate: (value: string) =>
-        value.trim().length > 0 ? true : 'Informe o nome do credor.'
-    }
-  ]);
+async function commandAddDeposit(args: string[], options: Record<string, string | boolean>): Promise<void> {
+  const user = await requireActiveUser();
 
-  await system.registerDeposit(userId, {
-    name: answers.name.trim(),
-    value: answers.value,
-    isLoan: answers.isLoan,
-    creditorName: answers.creditorName
+  const valueText = args[0];
+  const name = args[1];
+
+  if (!valueText || !name) {
+    throw new Error(
+      'Uso: financas addDeposit <valor> <descricao> [--loan] [--creditor <nome>]'
+    );
+  }
+
+  const value = Number(valueText.replace(',', '.'));
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error('Valor do depósito inválido. Informe um número maior que 0.');
+  }
+
+  const isLoan = Boolean(options.loan);
+  const creditorName = typeof options.creditor === 'string' ? options.creditor : undefined;
+
+  await system.registerDeposit(user.id, {
+    name,
+    value,
+    isLoan,
+    creditorName
   });
 
-  printSuccess(`Depósito registrado: ${formatMoney(answers.value)}`);
+  printSuccess(`Depósito registrado para ${user.name}: ${formatMoney(value)}`);
 }
 
-async function registerDebt(): Promise<void> {
-  const userId = requireActiveUser();
-  const answers = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'title',
-      message: 'Título da dívida:',
-      validate: (value: string) =>
-        value.trim().length > 0 ? true : 'Informe um título válido.'
-    },
-    {
-      type: 'input',
-      name: 'credor',
-      message: 'Credor:',
-      validate: (value: string) =>
-        value.trim().length > 0 ? true : 'Informe um credor válido.'
-    },
-    {
-      type: 'confirm',
-      name: 'indefiniteAmount',
-      message: 'Valor total da dívida é indefinido?',
-      default: false
-    },
-    {
-      type: 'number',
-      name: 'amount',
-      message: 'Valor total da dívida (R$):',
-      when: (answersMap: { indefiniteAmount: boolean }) =>
-        !answersMap.indefiniteAmount,
-      validate: (value: number) =>
-        Number.isFinite(value) && value > 0 ? true : 'Informe um valor maior que 0.'
-    },
-    {
-      type: 'confirm',
-      name: 'indefiniteInstallments',
-      message: 'Número de parcelas é indefinido?',
-      default: false
-    },
-    {
-      type: 'number',
-      name: 'totalInstallments',
-      message: 'Quantidade de parcelas:',
-      default: 1,
-      when: (answersMap: { indefiniteInstallments: boolean }) =>
-        !answersMap.indefiniteInstallments,
-      validate: (value: number) =>
-        Number.isInteger(value) && value >= 1
-          ? true
-          : 'Informe um número inteiro maior ou igual a 1.'
-    },
-    {
-      type: 'input',
-      name: 'tagsText',
-      message: 'Tags (separadas por vírgula):',
-      default: ''
-    },
-    {
-      type: 'input',
-      name: 'dueDate',
-      message: 'Data de vencimento (YYYY-MM-DD):',
-      default: new Date().toISOString().slice(0, 10),
-      validate: (value: string) => {
-        const date = new Date(value);
-        return Number.isNaN(date.getTime())
-          ? 'Informe uma data válida no formato YYYY-MM-DD.'
-          : true;
-      }
-    },
-    {
-      type: 'list',
-      name: 'status',
-      message: 'Status inicial da dívida:',
-      default: 'pending',
-      choices: [
-        { name: 'Pendente', value: 'pending' },
-        { name: 'Parcialmente paga', value: 'partially_paid' },
-        { name: 'Paga', value: 'paid' }
-      ]
-    }
-  ]);
+async function commandAddDebt(args: string[], options: Record<string, string | boolean>): Promise<void> {
+  const user = await requireActiveUser();
 
-  const tags = String(answers.tagsText)
-    .split(',')
-    .map((tag: string) => tag.trim())
-    .filter((tag: string) => tag.length > 0);
+  const title = args[0];
+  const credor = args[1];
 
-  await system.registerDebt(userId, {
-    title: answers.title.trim(),
-    credor: answers.credor.trim(),
-    amount: answers.indefiniteAmount ? undefined : answers.amount,
-    status: answers.status as DebtStatus,
+  if (!title || !credor) {
+    throw new Error(
+      'Uso: financas addDebt <titulo> <credor> [--amount <valor>] [--installments <n>] [--due <YYYY-MM-DD>] [--tags <a,b>]'
+    );
+  }
+
+  const amount =
+    typeof options.amount === 'string'
+      ? Number(options.amount.replace(',', '.'))
+      : undefined;
+
+  if (amount !== undefined && (!Number.isFinite(amount) || amount <= 0)) {
+    throw new Error('O valor total da dívida deve ser um número maior que 0.');
+  }
+
+  const installments =
+    typeof options.installments === 'string' ? Number(options.installments) : undefined;
+
+  if (
+    installments !== undefined &&
+    (!Number.isInteger(installments) || installments < 1)
+  ) {
+    throw new Error('Parcelas inválidas. Informe um número inteiro maior ou igual a 1.');
+  }
+
+  const dueDateInput = typeof options.due === 'string' ? options.due : undefined;
+  const dueDate = dueDateInput ? new Date(dueDateInput) : new Date();
+
+  if (Number.isNaN(dueDate.getTime())) {
+    throw new Error('Data inválida. Use formato YYYY-MM-DD.');
+  }
+
+  const tags =
+    typeof options.tags === 'string'
+      ? options.tags
+          .split(',')
+          .map((tag) => tag.trim())
+          .filter((tag) => tag.length > 0)
+      : [];
+
+  await system.registerDebt(user.id, {
+    title,
+    credor,
+    amount,
     tags,
-    dueDate: new Date(answers.dueDate).toISOString(),
-    totalInstallments: answers.indefiniteInstallments
-      ? undefined
-      : answers.totalInstallments
+    dueDate: dueDate.toISOString(),
+    totalInstallments: installments
   });
 
-  printSuccess('Dívida registrada com sucesso.');
+  printSuccess(`Dívida registrada para ${user.name}: ${title}`);
 }
 
-async function listDeposits(): Promise<Deposit[]> {
-  const userId = requireActiveUser();
-  const deposits = await system.listDeposits(userId);
+async function commandListDebts(): Promise<void> {
+  const user = await requireActiveUser();
+  const debts = await system.listDebts(user.id);
 
-  console.log(chalk.bold('\n📥 Histórico de depósitos'));
-  if (deposits.length === 0) {
-    printInfo('Nenhum depósito encontrado para o usuário ativo.');
-    return deposits;
+  if (debts.length === 0) {
+    printInfo('Nenhuma dívida encontrada para o usuário ativo.');
+    return;
   }
 
   const table = new Table({
     head: [
-      chalk.white('#'),
+      chalk.white('ID'),
+      chalk.white('Título'),
+      chalk.white('Credor'),
+      chalk.white('Restante'),
+      chalk.white('Parcelas'),
+      chalk.white('Status'),
+      chalk.white('Vencimento')
+    ],
+    colWidths: [38, 20, 16, 14, 12, 16, 14],
+    wordWrap: true
+  });
+
+  debts.forEach((debt: Debt) => {
+    const totalInstallments = toNumber(debt.totalInstallments);
+    const paidInstallments = toNumber(debt.paidInstallments);
+    const hasFixedInstallments = Number.isInteger(totalInstallments) && totalInstallments >= 1;
+
+    table.push([
+      debt.id,
+      debt.title,
+      debt.credor,
+      formatMoney(debt.remainingAmount ?? debt.amount ?? 0),
+      hasFixedInstallments ? `${paidInstallments}/${totalInstallments}` : `${paidInstallments}/∞`,
+      debt.status,
+      formatDate(debt.dueDate)
+    ]);
+  });
+
+  console.log(table.toString());
+}
+
+async function commandListDeposits(): Promise<void> {
+  const user = await requireActiveUser();
+  const deposits = await system.listDeposits(user.id);
+
+  if (deposits.length === 0) {
+    printInfo('Nenhum depósito encontrado para o usuário ativo.');
+    return;
+  }
+
+  const table = new Table({
+    head: [
+      chalk.white('ID'),
       chalk.white('Descrição'),
       chalk.white('Valor'),
       chalk.white('Empréstimo'),
       chalk.white('Credor'),
       chalk.white('Data')
     ],
-    colWidths: [5, 24, 16, 12, 22, 14]
+    colWidths: [38, 22, 14, 12, 20, 14]
   });
 
-  deposits.forEach((deposit, index) => {
+  deposits.forEach((deposit: Deposit) => {
     table.push([
-      index + 1,
+      deposit.id,
       deposit.name,
       formatMoney(deposit.value),
       deposit.isLoan ? 'Sim' : 'Não',
@@ -371,409 +416,107 @@ async function listDeposits(): Promise<Deposit[]> {
   });
 
   console.log(table.toString());
-  return deposits;
 }
 
-function debtStatusLabel(status: DebtStatus): string {
-  if (status === 'paid') return chalk.green('Paga');
-  if (status === 'partially_paid') return chalk.yellow('Parcial');
-  return chalk.red('Pendente');
-}
+async function commandPayDebt(debtId?: string, installmentsText?: string, amountText?: string): Promise<void> {
+  const user = await requireActiveUser();
 
-function calculateExpectedFixedInstallmentAmount(
-  debt: Debt,
-  installmentsToPay: number
-): number {
-  const totalInstallments = toNumber(debt.totalInstallments);
-  const paidInstallments = toNumber(debt.paidInstallments);
-  const remainingAmount = toNumber(debt.remainingAmount);
-  const baseInstallmentAmount =
-    toNumber(debt.installmentAmount) ||
-    Number((toNumber(debt.amount) / totalInstallments).toFixed(2));
-
-  let expected = 0;
-  for (let index = 1; index <= installmentsToPay; index++) {
-    const isLastInstallment = paidInstallments + index >= totalInstallments;
-    expected += isLastInstallment
-      ? Number((remainingAmount - expected).toFixed(2))
-      : baseInstallmentAmount;
+  if (!debtId || !installmentsText) {
+    throw new Error('Uso: financas payDebt <debtId> <parcelas> [valor]');
   }
 
-  return Number(expected.toFixed(2));
-}
-
-function hasKnownRemainingAmount(debt: Debt): boolean {
-  return (
-    typeof debt.remainingAmount === 'number' &&
-    Number.isFinite(debt.remainingAmount) &&
-    debt.remainingAmount >= 0
-  );
-}
-
-async function listDebts(): Promise<Debt[]> {
-  const userId = requireActiveUser();
-  const debts = await system.listDebts(userId);
-
-  console.log(chalk.bold('\n🧾 Dívidas do usuário ativo'));
-  if (debts.length === 0) {
-    printInfo('Nenhuma dívida encontrada para o usuário ativo.');
-    return debts;
+  const installments = Number(installmentsText);
+  if (!Number.isInteger(installments) || installments < 1) {
+    throw new Error('Parcelas inválidas. Informe um inteiro >= 1.');
   }
 
-  const table = new Table({
-    head: [
-      chalk.white('#'),
-      chalk.white('Título'),
-      chalk.white('Credor'),
-      chalk.white('Total'),
-      chalk.white('Restante'),
-      chalk.white('Parcelas'),
-      chalk.white('Status'),
-      chalk.white('Vencimento')
-    ],
-    colWidths: [5, 22, 18, 13, 13, 13, 12, 14],
-    wordWrap: true
-  });
+  const amount =
+    amountText === undefined
+      ? undefined
+      : Number(amountText.replace(',', '.'));
 
-  debts.forEach((debt, index) => {
-    const hasFixedInstallments =
-      Number.isInteger(toNumber(debt.totalInstallments)) &&
-      toNumber(debt.totalInstallments) >= 1;
-
-    table.push([
-      index + 1,
-      debt.title,
-      debt.credor,
-      formatOptionalMoney(debt.amount),
-      formatOptionalMoney(debt.remainingAmount),
-      hasFixedInstallments
-        ? `${toNumber(debt.paidInstallments)}/${toNumber(debt.totalInstallments)}`
-        : `${toNumber(debt.paidInstallments)}/∞`,
-      debtStatusLabel(debt.status),
-      formatDate(debt.dueDate)
-    ]);
-  });
-
-  console.log(table.toString());
-  return debts;
-}
-
-async function payDebt(): Promise<void> {
-  const userId = requireActiveUser();
-  const debts = await system.listDebts(userId);
-  const payableDebts = debts.filter((debt) => debt.status !== 'paid');
-
-  if (payableDebts.length === 0) {
-    printInfo('Não há dívidas em aberto para pagamento.');
-    return;
+  if (amount !== undefined && (!Number.isFinite(amount) || amount <= 0)) {
+    throw new Error('Valor inválido. Informe um número maior que 0.');
   }
 
-  const { debtId } = await inquirer.prompt([
-    {
-      type: 'list',
-      name: 'debtId',
-      message: 'Selecione a dívida para pagar:',
-      choices: payableDebts.map((debt) => {
-        const hasFixedInstallments =
-          Number.isInteger(toNumber(debt.totalInstallments)) &&
-          toNumber(debt.totalInstallments) >= 1;
-        const remainingInstallments = hasFixedInstallments
-          ? toNumber(debt.totalInstallments) - toNumber(debt.paidInstallments)
-          : null;
-
-        return {
-          name: `${debt.title} • restante ${formatOptionalMoney(debt.remainingAmount)} • ${
-            remainingInstallments === null
-              ? 'parcelas indefinidas'
-              : `${remainingInstallments} parcela(s)`
-          }`,
-          value: debt.id
-        };
-      })
-    }
-  ]);
-
-  const selectedDebt = payableDebts.find((item) => item.id === debtId);
-  if (!selectedDebt) {
-    throw new Error('Dívida selecionada não encontrada.');
-  }
-
-  const hasFixedInstallments =
-    Number.isInteger(toNumber(selectedDebt.totalInstallments)) &&
-    toNumber(selectedDebt.totalInstallments) >= 1;
-  const maxInstallments = hasFixedInstallments
-    ? toNumber(selectedDebt.totalInstallments) - toNumber(selectedDebt.paidInstallments)
-    : null;
-
-  const { installmentsToPay } = await inquirer.prompt([
-    {
-      type: 'number',
-      name: 'installmentsToPay',
-      message:
-        maxInstallments === null
-          ? 'Quantas parcelas deseja registrar neste pagamento?'
-          : `Quantas parcelas deseja pagar agora? (máx. ${maxInstallments})`,
-      default: 1,
-      validate: (value: number) =>
-        Number.isInteger(value) &&
-        value >= 1 &&
-        (maxInstallments === null || value <= maxInstallments)
-          ? true
-          : maxInstallments === null
-            ? 'Informe um valor inteiro maior ou igual a 1.'
-            : `Informe um valor inteiro entre 1 e ${maxInstallments}.`
-    }
-  ]);
-
-  const hasRemainingAmount = hasKnownRemainingAmount(selectedDebt);
-  const expectedAmount = hasFixedInstallments && hasRemainingAmount
-    ? calculateExpectedFixedInstallmentAmount(selectedDebt, installmentsToPay)
-    : null;
-
-  const { amountText } = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'amountText',
-      message:
-        expectedAmount === null
-          ? 'Valor a pagar agora (R$):'
-          : `Valor a pagar agora (R$) [ENTER para sugerido ${formatMoney(expectedAmount)}]:`,
-      validate: (value: string) => {
-        const trimmed = value.trim();
-        if (trimmed.length === 0 && expectedAmount !== null) {
-          return true;
-        }
-
-        const parsed = Number(trimmed.replace(',', '.'));
-        if (!Number.isFinite(parsed) || parsed <= 0) {
-          return 'Informe um valor numérico maior que 0.';
-        }
-
-        if (hasRemainingAmount && parsed > toNumber(selectedDebt.remainingAmount)) {
-          return 'O valor não pode ser maior que o saldo restante da dívida.';
-        }
-
-        return true;
-      }
-    }
-  ]);
-
-  const trimmedAmount = String(amountText).trim();
-  const parsedAmount =
-    trimmedAmount.length === 0 ? undefined : Number(trimmedAmount.replace(',', '.'));
-
-  const result = await system.payDebt(userId, debtId, parsedAmount, installmentsToPay);
-
-  const installmentsProgress = result.totalInstallments
-    ? `${result.paidInstallments}/${result.totalInstallments} parcelas`
-    : `${result.paidInstallments} parcela(s) registradas`;
-
+  const result = await system.payDebt(user.id, debtId, amount, installments);
   printSuccess(
-    `Pagamento concluído (${installmentsProgress}). Restante: ${formatOptionalMoney(result.remainingAmount)}`
+    `Pagamento concluído: ${result.paidInstallments}/${result.totalInstallments ?? '∞'} parcelas • restante ${formatMoney(result.remainingAmount ?? 0)}`
   );
 }
 
-async function deleteUser(): Promise<void> {
-  const users = await personRepo.list();
-  if (users.length === 0) {
-    printInfo('Não há usuários para remover.');
+async function commandDeleteUser(identifier?: string): Promise<void> {
+  if (!identifier || !identifier.trim()) {
+    throw new Error('Uso: financas deleteUser <nome-ou-id>');
+  }
+
+  const user = await resolveUserByNameOrId(identifier);
+  await personRepo.delete(user.id);
+
+  const state = await readState();
+  if (state.activeUserId === user.id) {
+    await writeState({});
+  }
+
+  printSuccess(`Usuário removido: ${user.name}`);
+}
+
+async function run(): Promise<void> {
+  const argv = process.argv.slice(2);
+  const command = argv[0];
+
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    await commandHelp();
     return;
   }
 
-  const { userId } = await inquirer.prompt([
-    {
-      type: 'list',
-      name: 'userId',
-      message: 'Selecione o usuário que será removido:',
-      choices: users.map((user) => ({
-        name: `${user.name} • ${formatMoney(user.money)} • ${user.id}`,
-        value: user.id
-      }))
-    }
-  ]);
+  const { positional, options } = parseOptions(argv.slice(1));
 
-  const selected = users.find((item) => item.id === userId);
-  const { confirmDelete } = await inquirer.prompt([
-    {
-      type: 'confirm',
-      name: 'confirmDelete',
-      message: `Confirmar remoção de ${selected?.name}? Esta ação também remove dívidas e depósitos relacionados.`,
-      default: false
-    }
-  ]);
-
-  if (!confirmDelete) {
-    printInfo('Remoção cancelada.');
-    return;
-  }
-
-  await personRepo.delete(userId);
-  if (activeUserId === userId) {
-    activeUserId = null;
-  }
-  printSuccess('Usuário removido com sucesso.');
-}
-
-type MainAction =
-  | 'create-user'
-  | 'select-user'
-  | 'list-users'
-  | 'summary'
-  | 'add-deposit'
-  | 'add-debt'
-  | 'list-deposits'
-  | 'list-debts'
-  | 'pay-debt'
-  | 'delete-user'
-  | 'exit';
-
-const MAIN_ACTION_OPTIONS: Array<{
-  shortcut: string;
-  name: string;
-  value: MainAction;
-}> = [
-  { shortcut: '1', name: '👤 Criar usuário', value: 'create-user' },
-  { shortcut: '2', name: '🎯 Selecionar usuário ativo', value: 'select-user' },
-  { shortcut: '3', name: '👥 Listar usuários', value: 'list-users' },
-  { shortcut: '4', name: '📊 Ver resumo do usuário ativo', value: 'summary' },
-  { shortcut: '5', name: '💰 Registrar depósito', value: 'add-deposit' },
-  { shortcut: '6', name: '🧾 Registrar dívida', value: 'add-debt' },
-  { shortcut: '7', name: '📥 Listar depósitos', value: 'list-deposits' },
-  { shortcut: '8', name: '📋 Listar dívidas', value: 'list-debts' },
-  { shortcut: '9', name: '💳 Pagar parcelas de dívida', value: 'pay-debt' },
-  { shortcut: '10', name: '🗑️  Remover usuário', value: 'delete-user' },
-  { shortcut: '11', name: '🚪 Sair', value: 'exit' }
-];
-
-async function askMainAction(): Promise<string> {
-  const { shortcut } = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'shortcut',
-      message: 'Atalho rápido (1-11) ou ENTER para abrir o menu:',
-      filter: (value: string) => value.trim()
-    }
-  ]);
-
-  if (shortcut.length > 0) {
-    const selectedByShortcut = MAIN_ACTION_OPTIONS.find(
-      (option) => option.shortcut === shortcut
-    );
-
-    if (selectedByShortcut) {
-      return selectedByShortcut.value;
-    }
-
-    printInfo('Atalho inválido. Abrindo menu completo...');
-  }
-
-  const { action } = await inquirer.prompt([
-    {
-      type: 'list',
-      name: 'action',
-      message: 'Escolha uma ação:',
-      pageSize: 12,
-      choices: MAIN_ACTION_OPTIONS.map((option) => ({
-        name: `[${option.shortcut}] ${option.name}`,
-        value: option.value
-      }))
-    }
-  ]);
-
-  return action;
-}
-
-async function runAction(action: string): Promise<boolean> {
+  Neo4jService.connect();
   try {
-    switch (action) {
-      case 'create-user':
-        await createUser();
+    switch (command) {
+      case 'createUser':
+        await commandCreateUser(positional[0], positional[1]);
         break;
-      case 'select-user':
-        await selectActiveUser();
+      case 'setUser':
+        await commandSetUser(positional[0]);
         break;
-      case 'list-users':
-        await listUsers();
+      case 'whoami':
+        await commandWhoAmI();
+        break;
+      case 'listUsers':
+        await commandListUsers();
         break;
       case 'summary':
-        await showActiveUserSummary();
+        await commandSummary();
         break;
-      case 'add-deposit':
-        await registerDeposit();
+      case 'addDeposit':
+        await commandAddDeposit(positional, options);
         break;
-      case 'add-debt':
-        await registerDebt();
+      case 'addDebt':
+        await commandAddDebt(positional, options);
         break;
-      case 'list-deposits':
-        await listDeposits();
+      case 'listDebts':
+        await commandListDebts();
         break;
-      case 'list-debts':
-        await listDebts();
+      case 'listDeposits':
+        await commandListDeposits();
         break;
-      case 'pay-debt':
-        await payDebt();
+      case 'payDebt':
+        await commandPayDebt(positional[0], positional[1], positional[2]);
         break;
-      case 'delete-user':
-        await deleteUser();
+      case 'deleteUser':
+        await commandDeleteUser(positional[0]);
         break;
-      case 'exit':
-        return false;
       default:
-        printInfo('Ação inválida.');
-        break;
+        throw new Error(`Comando inválido: ${command}. Use: financas help`);
     }
-  } catch (error) {
-    printError(error);
-  }
-
-  return true;
-}
-
-async function pause(): Promise<void> {
-  await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'continue',
-      message: 'Pressione ENTER para continuar...'
-    }
-  ]);
-}
-
-async function boot(): Promise<void> {
-  Neo4jService.connect();
-
-  try {
-    let running = true;
-
-    while (running) {
-      printHeader();
-      const currentUser = activeUserId ? await personRepo.findById(activeUserId) : null;
-      console.log(
-        chalk.white(
-          `Usuário ativo: ${
-            currentUser
-              ? `${currentUser.name} (${formatMoney(currentUser.money)})`
-              : 'nenhum'
-          }\n`
-        )
-      );
-
-      const action = await askMainAction();
-      running = await runAction(action);
-
-      if (running) {
-        console.log('');
-        await pause();
-      }
-    }
-
-    printSuccess('Sessão finalizada. Até logo!');
   } finally {
     await Neo4jService.close();
   }
 }
 
-boot().catch((error) => {
+run().catch((error) => {
   printError(error);
   process.exit(1);
 });
