@@ -4,7 +4,7 @@ export interface Deposit {
   value: number;
   isLoan?: boolean;
   creditorName?: string;
-  date: Date;
+  date: string;
 }
 
 export interface DepositDTO {
@@ -12,5 +12,5 @@ export interface DepositDTO {
   value: number;
   isLoan?: boolean;
   creditorName?: string;
-  date?: Date;
+  date?: string;
 }

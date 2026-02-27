@@ -8,13 +8,39 @@ export class DebtRepository extends BaseRepository<Debt> {
   }
 
   public async addDebt(
-    personId,
-    { id, title, amount, tags, dueDate, payDate }: Debt
-  ) {
+    personId: string,
+    {
+      id,
+      title,
+      credor,
+      amount,
+      status,
+      tags,
+      dueDate,
+      payDate,
+      totalInstallments,
+      paidInstallments,
+      installmentAmount,
+      remainingAmount
+    }: Debt
+  ): Promise<void> {
     const session = Neo4jService.getSession();
     const query = `
       MATCH (p:Person { id: $personId })
-      CREATE (d:Debt { id: $id, title: $title, amount: $amount, tags: $tags, status: 'pending', dueDate: $dueDate, payDate: $payDate })
+      CREATE (d:Debt {
+        id: $id,
+        title: $title,
+        credor: $credor,
+        amount: $amount,
+        tags: $tags,
+        status: $status,
+        dueDate: $dueDate,
+        payDate: $payDate,
+        totalInstallments: $totalInstallments,
+        paidInstallments: $paidInstallments,
+        installmentAmount: $installmentAmount,
+        remainingAmount: $remainingAmount
+      })
       CREATE (p)-[:HAS_BILL]->(d)
       return d
     `;
@@ -23,17 +49,23 @@ export class DebtRepository extends BaseRepository<Debt> {
         personId,
         id,
         title,
+        credor,
         amount,
+        status,
         tags,
         dueDate,
-        payDate
+        payDate,
+        totalInstallments,
+        paidInstallments,
+        installmentAmount,
+        remainingAmount
       });
     } finally {
       await session.close();
     }
   }
 
-  async listDebtsByPersonId(personId: string): Promise<Debt[]> {
+  public async listDebtsByPersonId(personId: string): Promise<Debt[]> {
     const session = Neo4jService.getSession();
     const query = `
         MATCH (p:Person { id: $personId })-[:HAS_BILL]->(d:Debt)

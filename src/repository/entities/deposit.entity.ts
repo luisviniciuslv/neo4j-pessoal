@@ -14,8 +14,8 @@ export default class DepositRepository extends BaseRepository<Deposit> {
     isLoan: boolean,
     creditorName: string,
     value: number,
-    date: Date = new Date()
-  ) {
+    date: string = new Date().toISOString()
+  ): Promise<void> {
     const session = Neo4jService.getSession();
     const query = `
       MATCH (p:Person { id: $personId })
@@ -31,14 +31,14 @@ export default class DepositRepository extends BaseRepository<Deposit> {
         value,
         isLoan,
         creditorName,
-        date: date.toISOString()
+        date
       });
     } finally {
       await session.close();
     }
   }
 
-  async lisDepositByUserId(personId): Promise<Deposit[]> {
+  async lisDepositByUserId(personId: string): Promise<Deposit[]> {
     const session = Neo4jService.getSession();
     const query = `
       MATCH (p:Person { id: $personId })-[:HAS_DEPOSIT]->(d:Deposit)
